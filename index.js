@@ -5,32 +5,21 @@ const http = require('http');
 const WebSocket = require('ws');
 require('dotenv').config();
 
-let raknetModule = null;
-try {
-  raknetModule = require('@bedrock-protocol/raknet');
-} catch (e) {
-  console.warn('⚠️ RakNet package not loaded:', e.message);
-}
-
 const app = express();
 const PORT = process.env.PORT || 3001;
-const RAKNET_PORT = process.env.RAKNET_PORT || 19132;
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL
 });
 
-// Create HTTP server
+// Create HTTP server (for Express REST & WebSocket)
 const server = http.createServer(app);
 
 // Create WebSocket server
 const wss = new WebSocket.Server({ server });
 
-// Track active connections
-const wsClients = new Map();     // userId -> ws connection
-const raknetClients = new Map(); // userId -> raknet connection
-
-let raknetServer = null;
+// Track active WebSocket connections
+const wsClients = new Map(); // userId -> ws connection
 
 // GitHub OAuth Configuration
 const GITHUB_CLIENT_ID = process.env.GITHUB_CLIENT_ID;
@@ -80,27 +69,15 @@ function databaseError(res, error) {
   return res.status(500).json({ error: 'Database operation failed' });
 }
 
-// Unified Broadcast across WebSocket and RakNet
+// Broadcast message across connected WebSocket clients
 function broadcastMessage(messageObj) {
   const payload = JSON.stringify(messageObj);
 
-  // Send to WebSocket clients
   wss.clients.forEach((client) => {
     if (client.readyState === WebSocket.OPEN) {
       client.send(payload);
     }
   });
-
-  // Send to RakNet clients
-  for (const [userId, clientConnection] of raknetClients.entries()) {
-    try {
-      if (clientConnection && typeof clientConnection.send === 'function') {
-        clientConnection.send(Buffer.from(payload));
-      }
-    } catch (err) {
-      console.error(`Failed to send RakNet message to user ${userId}:`, err);
-    }
-  }
 }
 
 // =====================================
@@ -155,75 +132,6 @@ wss.on('connection', (ws) => {
 });
 
 // =====================================
-// RAKNET HANDLERS
-// =====================================
-
-function startRakNetServer() {
-  if (!raknetModule || !raknetModule.Server) {
-    console.warn('⚠️ RakNet protocol module unavailable. Running in HTTP/WebSocket mode only.');
-    return;
-  }
-
-  try {
-    raknetServer = new raknetModule.Server({
-      host: '0.0.0.0',
-      port: Number(RAKNET_PORT)
-    });
-
-    raknetServer.on('openConnection', (client) => {
-      console.log('🔌 New RakNet connection established');
-      let userId = null;
-
-      client.on('encapsulated', (packet) => {
-        try {
-          const rawString = packet.buffer ? packet.buffer.toString('utf-8') : packet.toString('utf-8');
-          const message = JSON.parse(rawString);
-
-          if (message.type === 'auth') {
-            userId = message.userId;
-            raknetClients.set(userId, client);
-            console.log(`✅ [RakNet] User ${userId} authenticated`);
-
-            const ack = Buffer.from(JSON.stringify({ type: 'auth_success', message: 'Connected to RakNet server' }));
-            client.send(ack);
-            return;
-          }
-
-          if (message.type === 'stats_update') {
-            console.log(`📊 [RakNet] Stats update from ${userId}:`, message.data);
-            broadcastMessage({
-              type: 'stats_update',
-              userId,
-              data: message.data,
-              timestamp: new Date().toISOString()
-            });
-          }
-
-          if (message.type === 'ping') {
-            const pong = Buffer.from(JSON.stringify({ type: 'pong' }));
-            client.send(pong);
-          }
-        } catch (err) {
-          console.error('RakNet packet decode error:', err);
-        }
-      });
-
-      client.on('close', () => {
-        if (userId) {
-          raknetClients.delete(userId);
-          console.log(`❌ [RakNet] User ${userId} disconnected`);
-        }
-      });
-    });
-
-    raknetServer.listen();
-    console.log(`🚀 RakNet UDP server listening on port ${RAKNET_PORT}`);
-  } catch (err) {
-    console.error('RakNet startup warning:', err.message);
-  }
-}
-
-// =====================================
 // REST ROUTES
 // =====================================
 
@@ -238,8 +146,7 @@ app.get('/', (req, res) => {
       'DELETE /api/accounts/:userId/:accountName',
       'POST /api/calculate-pot',
       'POST /api/calculate-upgrades',
-      'WS / (WebSocket connection)',
-      `UDP :${RAKNET_PORT} (RakNet connection)`
+      'WS / (WebSocket connection)'
     ]
   });
 });
@@ -525,9 +432,6 @@ app.use((req, res) => {
 async function startServer() {
   try {
     await initializeDatabase();
-
-    // Start RakNet UDP Server
-    startRakNetServer();
 
     // Start Express REST & WebSocket Server
     server.listen(PORT, '0.0.0.0', () => {
