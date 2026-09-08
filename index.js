@@ -3,13 +3,8 @@ const cors = require('cors');
 const { Pool } = require('pg');
 const http = require('http');
 const WebSocket = require('ws');
-const raknet = require('raknet-native');
+const { Server: RakNetServer } = require('js-raknet');
 require('dotenv').config();
-
-// Safely extract RakNet exports across different module formats
-const PacketPriority = raknet.PacketPriority || {};
-const PacketReliability = raknet.PacketReliability || {};
-const ListenerClass = raknet.Listener || raknet.default || raknet;
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -19,15 +14,17 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL
 });
 
-// Create HTTP server (needed for Express & WebSocket upgrade)
+// Create HTTP server (for Express REST & WebSocket upgrade)
 const server = http.createServer(app);
 
 // Create WebSocket server
 const wss = new WebSocket.Server({ server });
 
-// Store connected clients
+// Track active connections
 const wsClients = new Map();     // userId -> ws connection
-const raknetClients = new Map(); // userId -> raknet connection
+const raknetClients = new Map(); // userId -> raknet address string
+
+let raknetServer = null;
 
 // GitHub OAuth Configuration
 const GITHUB_CLIENT_ID = process.env.GITHUB_CLIENT_ID;
@@ -77,7 +74,7 @@ function databaseError(res, error) {
   return res.status(500).json({ error: 'Database operation failed' });
 }
 
-// Unified Broadcast for WebSocket and RakNet clients
+// Unified Broadcast across WebSocket and RakNet
 function broadcastMessage(messageObj) {
   const payload = JSON.stringify(messageObj);
 
@@ -89,13 +86,14 @@ function broadcastMessage(messageObj) {
   });
 
   // Send to RakNet clients
-  for (const [, connection] of raknetClients.entries()) {
-    connection.send(
-      Buffer.from(payload),
-      PacketPriority.MEDIUM_PRIORITY ?? 1,
-      PacketReliability.RELIABLE_ORDERED ?? 2,
-      0
-    );
+  if (raknetServer) {
+    for (const [userId, clientAddr] of raknetClients.entries()) {
+      try {
+        raknetServer.send(clientAddr, Buffer.from(payload));
+      } catch (err) {
+        console.error(`Failed to send RakNet message to user ${userId}:`, err);
+      }
+    }
   }
 }
 
@@ -155,74 +153,43 @@ wss.on('connection', (ws) => {
 // =====================================
 
 function startRakNetServer() {
-  if (typeof ListenerClass !== 'function') {
-    throw new Error('RakNet Listener module failed to load properly.');
-  }
+  raknetServer = new RakNetServer('0.0.0.0', Number(RAKNET_PORT));
 
-  const raknetListener = new ListenerClass();
+  raknetServer.on('encapsulated', (packet, address) => {
+    try {
+      const rawString = packet.buffer.toString('utf-8');
+      const message = JSON.parse(rawString);
 
-  raknetListener.on('pong', (addr, ping) => {
-    console.log(`📡 RakNet Ping received from ${addr}`);
+      if (message.type === 'auth') {
+        const userId = message.userId;
+        raknetClients.set(userId, address);
+        console.log(`✅ [RakNet] User ${userId} authenticated from ${address}`);
+
+        const ack = Buffer.from(JSON.stringify({ type: 'auth_success', message: 'Connected to RakNet server' }));
+        raknetServer.send(address, ack);
+        return;
+      }
+
+      if (message.type === 'stats_update') {
+        console.log(`📊 [RakNet] Stats update from ${address}:`, message.data);
+        broadcastMessage({
+          type: 'stats_update',
+          data: message.data,
+          timestamp: new Date().toISOString()
+        });
+      }
+
+      if (message.type === 'ping') {
+        const pong = Buffer.from(JSON.stringify({ type: 'pong' }));
+        raknetServer.send(address, pong);
+      }
+    } catch (err) {
+      console.error('RakNet packet decode error:', err);
+    }
   });
 
-  raknetListener.listen('0.0.0.0', RAKNET_PORT);
-  console.log(`🚀 RakNet listener bound to UDP port ${RAKNET_PORT}`);
-
-  raknetListener.on('openConnection', (connection) => {
-    console.log(`🔌 New RakNet connection from ${connection.address}`);
-    let userId = null;
-
-    connection.on('encapsulated', async (packet) => {
-      try {
-        const rawString = packet.buffer.toString('utf-8');
-        const message = JSON.parse(rawString);
-
-        if (message.type === 'auth') {
-          userId = message.userId;
-          raknetClients.set(userId, connection);
-          console.log(`✅ [RakNet] User ${userId} authenticated`);
-
-          const ack = Buffer.from(JSON.stringify({ type: 'auth_success', message: 'Connected to RakNet server' }));
-          connection.send(
-            ack,
-            PacketPriority.IMMEDIATE_PRIORITY ?? 0,
-            PacketReliability.RELIABLE_ORDERED ?? 2,
-            0
-          );
-          return;
-        }
-
-        if (message.type === 'stats_update') {
-          console.log(`📊 [RakNet] Stats update from ${userId}:`, message.data);
-          broadcastMessage({
-            type: 'stats_update',
-            userId,
-            data: message.data,
-            timestamp: new Date().toISOString()
-          });
-        }
-
-        if (message.type === 'ping') {
-          const pong = Buffer.from(JSON.stringify({ type: 'pong' }));
-          connection.send(
-            pong,
-            PacketPriority.HIGH_PRIORITY ?? 1,
-            PacketReliability.UNRELIABLE ?? 0,
-            0
-          );
-        }
-      } catch (err) {
-        console.error('RakNet packet decode error:', err);
-      }
-    });
-
-    connection.on('close', () => {
-      if (userId) {
-        raknetClients.delete(userId);
-        console.log(`❌ [RakNet] User ${userId} disconnected`);
-      }
-    });
-  });
+  raknetServer.listen();
+  console.log(`🚀 RakNet UDP server running on port ${RAKNET_PORT}`);
 }
 
 // =====================================
@@ -528,10 +495,10 @@ async function startServer() {
   try {
     await initializeDatabase();
 
-    // Start RakNet Server
+    // Start RakNet UDP Listener
     startRakNetServer();
 
-    // Start HTTP & WebSocket Server
+    // Start Express & WebSocket Server
     server.listen(PORT, '0.0.0.0', () => {
       console.log(`🎮 Game Tracker API running on http://localhost:${PORT}`);
       console.log(`📡 CORS enabled for all origins`);
