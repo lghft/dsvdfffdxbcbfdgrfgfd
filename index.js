@@ -143,8 +143,8 @@ wss.on('connection', (ws) => {
           await pool.query(`
             UPDATE game_accounts 
             SET is_online = $1, updated_at = NOW() 
-            WHERE user_id = $2 AND account_name = $3
-          `, [isOnline, targetUserId, accountName]);
+            WHERE (user_id = $2 OR user_id = $3) AND LOWER(account_name) = LOWER($4)
+          `, [isOnline, targetUserId, userId, accountName]);
 
           broadcastMessage({
             type: 'status_changed',
@@ -236,23 +236,27 @@ wss.on('connection', (ws) => {
 
   // Handle Connection Close
   ws.on('close', async () => {
+    const cleanUserId = userId ? userId.replace(/^github_/, '') : null;
     const targetUserId = process.env.CREATOR_GITHUB_ID 
       ? `github_${process.env.CREATOR_GITHUB_ID}` 
       : userId;
 
-    if (accountName && targetUserId) {
-      console.log(`❌ [WS] Account "${accountName}" (${targetUserId}) disconnected`);
+    if (accountName && (targetUserId || cleanUserId)) {
+      console.log(`❌ [WS] Account "${accountName}" (${targetUserId || cleanUserId}) disconnected`);
 
       try {
-        await pool.query(`
+        const result = await pool.query(`
           UPDATE game_accounts 
           SET is_online = false, updated_at = NOW() 
-          WHERE user_id = $1 AND account_name = $2
-        `, [targetUserId, accountName]);
+          WHERE (user_id = $1 OR user_id = $2 OR user_id = $3) 
+            AND LOWER(account_name) = LOWER($4)
+        `, [targetUserId, cleanUserId, userId, accountName]);
+
+        console.log(`📉 [DB DISCONNECT] Updated ${result.rowCount} row(s) to offline for "${accountName}"`);
 
         broadcastMessage({
           type: 'status_changed',
-          userId: targetUserId,
+          userId: targetUserId || userId,
           accountName,
           isOnline: false,
           timestamp: new Date().toISOString()
