@@ -3,8 +3,14 @@ const cors = require('cors');
 const { Pool } = require('pg');
 const http = require('http');
 const WebSocket = require('ws');
-const raknet = require('raknet-node');
 require('dotenv').config();
+
+let raknetModule = null;
+try {
+  raknetModule = require('@bedrock-protocol/raknet');
+} catch (e) {
+  console.warn('⚠️ RakNet package not loaded:', e.message);
+}
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -14,7 +20,7 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL
 });
 
-// Create HTTP server (for Express REST & WebSocket upgrade)
+// Create HTTP server
 const server = http.createServer(app);
 
 // Create WebSocket server
@@ -22,7 +28,7 @@ const wss = new WebSocket.Server({ server });
 
 // Track active connections
 const wsClients = new Map();     // userId -> ws connection
-const raknetClients = new Map(); // userId -> raknet session/client
+const raknetClients = new Map(); // userId -> raknet connection
 
 let raknetServer = null;
 
@@ -86,10 +92,10 @@ function broadcastMessage(messageObj) {
   });
 
   // Send to RakNet clients
-  for (const [userId, rakClient] of raknetClients.entries()) {
+  for (const [userId, clientConnection] of raknetClients.entries()) {
     try {
-      if (rakClient && typeof rakClient.send === 'function') {
-        rakClient.send(Buffer.from(payload));
+      if (clientConnection && typeof clientConnection.send === 'function') {
+        clientConnection.send(Buffer.from(payload));
       }
     } catch (err) {
       console.error(`Failed to send RakNet message to user ${userId}:`, err);
@@ -153,19 +159,18 @@ wss.on('connection', (ws) => {
 // =====================================
 
 function startRakNetServer() {
-  const ServerClass = raknet.Server || raknet.RakServer || raknet;
-  
-  if (typeof ServerClass !== 'function' && typeof ServerClass.create !== 'function') {
-    console.warn('⚠️ RakNet server class structure missing, running in standalone HTTP/WS mode.');
+  if (!raknetModule || !raknetModule.Server) {
+    console.warn('⚠️ RakNet protocol module unavailable. Running in HTTP/WebSocket mode only.');
     return;
   }
 
   try {
-    raknetServer = typeof ServerClass.create === 'function' 
-      ? ServerClass.create({ host: '0.0.0.0', port: Number(RAKNET_PORT) })
-      : new ServerClass('0.0.0.0', Number(RAKNET_PORT));
+    raknetServer = new raknetModule.Server({
+      host: '0.0.0.0',
+      port: Number(RAKNET_PORT)
+    });
 
-    raknetServer.on('connect', (client) => {
+    raknetServer.on('openConnection', (client) => {
       console.log('🔌 New RakNet connection established');
       let userId = null;
 
@@ -203,7 +208,7 @@ function startRakNetServer() {
         }
       });
 
-      client.on('disconnect', () => {
+      client.on('close', () => {
         if (userId) {
           raknetClients.delete(userId);
           console.log(`❌ [RakNet] User ${userId} disconnected`);
@@ -211,12 +216,10 @@ function startRakNetServer() {
       });
     });
 
-    if (typeof raknetServer.listen === 'function') {
-      raknetServer.listen();
-    }
-    console.log(`🚀 RakNet UDP server running on port ${RAKNET_PORT}`);
+    raknetServer.listen();
+    console.log(`🚀 RakNet UDP server listening on port ${RAKNET_PORT}`);
   } catch (err) {
-    console.error('Failed to initialize RakNet server:', err.message);
+    console.error('RakNet startup warning:', err.message);
   }
 }
 
@@ -523,10 +526,10 @@ async function startServer() {
   try {
     await initializeDatabase();
 
-    // Start RakNet Server
+    // Start RakNet UDP Server
     startRakNetServer();
 
-    // Start Express & WebSocket Server
+    // Start Express REST & WebSocket Server
     server.listen(PORT, '0.0.0.0', () => {
       console.log(`🎮 Game Tracker API running on http://localhost:${PORT}`);
       console.log(`📡 CORS enabled for all origins`);
