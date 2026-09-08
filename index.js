@@ -46,6 +46,7 @@ async function initializeDatabase() {
       stats JSONB NOT NULL DEFAULT '{"gold": 0, "xp": 0, "level": 1}'::jsonb,
       inventory JSONB NOT NULL DEFAULT '[]'::jsonb,
       progress JSONB NOT NULL DEFAULT '{}'::jsonb,
+      is_online BOOLEAN NOT NULL DEFAULT false,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       PRIMARY KEY (user_id, account_name)
@@ -56,6 +57,7 @@ async function initializeDatabase() {
 function serializeAccount(row) {
   return {
     accountName: row.account_name,
+    isOnline: row.is_online ?? false,
     stats: row.stats,
     inventory: row.inventory,
     progress: row.progress,
@@ -113,57 +115,89 @@ wss.on('connection', (ws) => {
         return;
       }
 
-      // 4. Game Data Sync Packet (Writes to Postgres under GitHub ID bucket)
-if (message.type === 'sync_account') {
-  const accountData = message.data || {};
-  const { account_name, stats, inventory, progress } = accountData;
+      // 4. Status Update (Online / Offline)
+      if (message.type === 'status_update') {
+        const { accountName, status } = message;
+        const isOnline = status === 'online';
+        const targetUserId = process.env.CREATOR_GITHUB_ID 
+          ? `github_${process.env.CREATOR_GITHUB_ID}` 
+          : (message.userId || userId);
 
-  // Map incoming game sync to the creator's GitHub user ID if configured
-  const targetUserId = process.env.CREATOR_GITHUB_ID 
-    ? `github_${process.env.CREATOR_GITHUB_ID}` 
-    : (message.userId || userId);
+        if (accountName && targetUserId) {
+          console.log(`🟢 [WS STATUS] Setting "${accountName}" to ${status} for User ${targetUserId}`);
 
-  if (!account_name || !targetUserId) {
-    console.error('❌ [WS SYNC] Missing account_name or userId');
-    return;
-  }
+          await pool.query(`
+            UPDATE game_accounts 
+            SET is_online = $1, updated_at = NOW() 
+            WHERE user_id = $2 AND account_name = $3
+          `, [isOnline, targetUserId, accountName]);
 
-  console.log(`📊 [WS SYNC] Saving account "${account_name}" for User ${targetUserId}...`);
+          broadcastMessage({
+            type: 'status_changed',
+            userId: targetUserId,
+            accountName,
+            isOnline,
+            timestamp: new Date().toISOString()
+          });
+        }
+        return;
+      }
 
-  await pool.query(`
-    INSERT INTO game_accounts (user_id, account_name, stats, inventory, progress)
-    VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb)
-    ON CONFLICT (user_id, account_name)
-    DO UPDATE SET
-      stats = EXCLUDED.stats,
-      inventory = EXCLUDED.inventory,
-      progress = EXCLUDED.progress,
-      updated_at = NOW()
-  `, [
-    targetUserId,
-    account_name,
-    JSON.stringify(stats || DEFAULT_STATS),
-    JSON.stringify(inventory || []),
-    JSON.stringify(progress || {})
-  ]);
+      // 5. Game Data Sync Packet
+      if (message.type === 'sync_account') {
+        const accountData = message.data || {};
+        const { account_name, stats, inventory, progress, online } = accountData;
 
-  console.log(`💾 [DB SUCCESS] Updated database for "${account_name}" under ${targetUserId}`);
-  
-  ws.send(JSON.stringify({
-    type: 'sync_success',
-    accountName: account_name,
-    timestamp: new Date().toISOString()
-  }));
+        const targetUserId = process.env.CREATOR_GITHUB_ID 
+          ? `github_${process.env.CREATOR_GITHUB_ID}` 
+          : (message.userId || userId);
 
-  broadcastMessage({
-    type: 'account_updated',
-    userId: targetUserId,
-    accountName: account_name,
-    stats,
-    timestamp: new Date().toISOString()
-  });
-  return;
-}
+        if (!account_name || !targetUserId) {
+          console.error('❌ [WS SYNC] Missing account_name or userId');
+          return;
+        }
+
+        console.log(`📊 [WS SYNC] Saving account "${account_name}" for User ${targetUserId}...`);
+
+        const isOnline = online ?? true;
+
+        await pool.query(`
+          INSERT INTO game_accounts (user_id, account_name, stats, inventory, progress, is_online)
+          VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb, $6)
+          ON CONFLICT (user_id, account_name)
+          DO UPDATE SET
+            stats = EXCLUDED.stats,
+            inventory = EXCLUDED.inventory,
+            progress = EXCLUDED.progress,
+            is_online = EXCLUDED.is_online,
+            updated_at = NOW()
+        `, [
+          targetUserId,
+          account_name,
+          JSON.stringify(stats || DEFAULT_STATS),
+          JSON.stringify(inventory || []),
+          JSON.stringify(progress || {}),
+          isOnline
+        ]);
+
+        console.log(`💾 [DB SUCCESS] Updated database for "${account_name}" under ${targetUserId}`);
+        
+        ws.send(JSON.stringify({
+          type: 'sync_success',
+          accountName: account_name,
+          timestamp: new Date().toISOString()
+        }));
+
+        broadcastMessage({
+          type: 'account_updated',
+          userId: targetUserId,
+          accountName: account_name,
+          isOnline,
+          stats,
+          timestamp: new Date().toISOString()
+        });
+        return;
+      }
 
       if (message.type === 'stats_update') {
         console.log(`📊 [WS] Stats update from ${userId}:`, message.data);
@@ -295,7 +329,7 @@ app.get('/api/accounts/:userId', async (req, res) => {
 
   try {
     const result = await pool.query(`
-      SELECT account_name, stats, inventory, progress, created_at, updated_at
+      SELECT account_name, stats, inventory, progress, is_online, created_at, updated_at
       FROM game_accounts
       WHERE user_id = $1
       ORDER BY created_at ASC, account_name ASC
@@ -314,7 +348,7 @@ app.get('/api/accounts/:userId', async (req, res) => {
 
 app.post('/api/accounts/:userId', async (req, res) => {
   const { userId } = req.params;
-  const { accountName, stats, inventory, progress } = req.body;
+  const { accountName, stats, inventory, progress, isOnline } = req.body;
 
   if (!accountName) {
     return res.status(400).json({ error: 'accountName is required' });
@@ -323,6 +357,7 @@ app.post('/api/accounts/:userId', async (req, res) => {
   const accountStats = stats || DEFAULT_STATS;
   const accountInventory = inventory || [];
   const accountProgress = progress || {};
+  const onlineState = isOnline ?? false;
 
   try {
     const existing = await pool.query(`
@@ -333,22 +368,24 @@ app.post('/api/accounts/:userId', async (req, res) => {
 
     const result = await pool.query(`
       INSERT INTO game_accounts (
-        user_id, account_name, stats, inventory, progress
+        user_id, account_name, stats, inventory, progress, is_online
       )
-      VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb)
+      VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb, $6)
       ON CONFLICT (user_id, account_name)
       DO UPDATE SET
         stats = EXCLUDED.stats,
         inventory = EXCLUDED.inventory,
         progress = EXCLUDED.progress,
+        is_online = EXCLUDED.is_online,
         updated_at = NOW()
-      RETURNING account_name, stats, inventory, progress, created_at, updated_at
+      RETURNING account_name, stats, inventory, progress, is_online, created_at, updated_at
     `, [
       userId,
       accountName,
       JSON.stringify(accountStats),
       JSON.stringify(accountInventory),
-      JSON.stringify(accountProgress)
+      JSON.stringify(accountProgress),
+      onlineState
     ]);
 
     const wasUpdated = existing.rowCount > 0;
@@ -369,7 +406,7 @@ app.delete('/api/accounts/:userId/:accountName', async (req, res) => {
     const deleted = await pool.query(`
       DELETE FROM game_accounts
       WHERE user_id = $1 AND account_name = $2
-      RETURNING account_name, stats, inventory, progress, created_at, updated_at
+      RETURNING account_name, stats, inventory, progress, is_online, created_at, updated_at
     `, [userId, accountName]);
 
     if (deleted.rowCount === 0) {
