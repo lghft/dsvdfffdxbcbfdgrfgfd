@@ -1,0 +1,16 @@
+{
+  "name": "game-tracker-backend",
+  "version": "1.0.0",
+  "description": "Multi-account game tracker API",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^16.6.1",
+    "express": "^5.2.1",
+    "pg": "^8.23.0"
+  }
+}
