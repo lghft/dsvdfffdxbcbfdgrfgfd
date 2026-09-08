@@ -3,8 +3,13 @@ const cors = require('cors');
 const { Pool } = require('pg');
 const http = require('http');
 const WebSocket = require('ws');
-const { Listener, PacketPriority, PacketReliability } = require('raknet-native');
+const raknet = require('raknet-native');
 require('dotenv').config();
+
+// Safely extract RakNet exports across different module formats
+const PacketPriority = raknet.PacketPriority || {};
+const PacketReliability = raknet.PacketReliability || {};
+const ListenerClass = raknet.Listener || raknet.default || raknet;
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -14,15 +19,15 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL
 });
 
-// Create HTTP server (for REST API and WebSocket upgrade)
+// Create HTTP server (needed for Express & WebSocket upgrade)
 const server = http.createServer(app);
 
 // Create WebSocket server
 const wss = new WebSocket.Server({ server });
 
-// Store connected WebSocket and RakNet clients
-const wsClients = new Map();     // userId -> ws
-const raknetClients = new Map(); // userId -> raknetConnection
+// Store connected clients
+const wsClients = new Map();     // userId -> ws connection
+const raknetClients = new Map(); // userId -> raknet connection
 
 // GitHub OAuth Configuration
 const GITHUB_CLIENT_ID = process.env.GITHUB_CLIENT_ID;
@@ -72,30 +77,30 @@ function databaseError(res, error) {
   return res.status(500).json({ error: 'Database operation failed' });
 }
 
-// Unified Broadcast for WS and RakNet
+// Unified Broadcast for WebSocket and RakNet clients
 function broadcastMessage(messageObj) {
   const payload = JSON.stringify(messageObj);
 
-  // Send to all connected WebSocket clients
+  // Send to WebSocket clients
   wss.clients.forEach((client) => {
     if (client.readyState === WebSocket.OPEN) {
       client.send(payload);
     }
   });
 
-  // Send to all connected RakNet clients
+  // Send to RakNet clients
   for (const [, connection] of raknetClients.entries()) {
     connection.send(
       Buffer.from(payload),
-      PacketPriority.MEDIUM_PRIORITY,
-      PacketReliability.RELIABLE_ORDERED,
+      PacketPriority.MEDIUM_PRIORITY ?? 1,
+      PacketReliability.RELIABLE_ORDERED ?? 2,
       0
     );
   }
 }
 
 // =====================================
-// WEBSOCKET SERVER HANDLERS
+// WEBSOCKET HANDLERS
 // =====================================
 
 wss.on('connection', (ws) => {
@@ -146,11 +151,15 @@ wss.on('connection', (ws) => {
 });
 
 // =====================================
-// RAKNET SERVER HANDLERS
+// RAKNET HANDLERS
 // =====================================
 
 function startRakNetServer() {
-  const raknetListener = new Listener();
+  if (typeof ListenerClass !== 'function') {
+    throw new Error('RakNet Listener module failed to load properly.');
+  }
+
+  const raknetListener = new ListenerClass();
 
   raknetListener.on('pong', (addr, ping) => {
     console.log(`📡 RakNet Ping received from ${addr}`);
@@ -174,7 +183,12 @@ function startRakNetServer() {
           console.log(`✅ [RakNet] User ${userId} authenticated`);
 
           const ack = Buffer.from(JSON.stringify({ type: 'auth_success', message: 'Connected to RakNet server' }));
-          connection.send(ack, PacketPriority.IMMEDIATE_PRIORITY, PacketReliability.RELIABLE_ORDERED, 0);
+          connection.send(
+            ack,
+            PacketPriority.IMMEDIATE_PRIORITY ?? 0,
+            PacketReliability.RELIABLE_ORDERED ?? 2,
+            0
+          );
           return;
         }
 
@@ -190,7 +204,12 @@ function startRakNetServer() {
 
         if (message.type === 'ping') {
           const pong = Buffer.from(JSON.stringify({ type: 'pong' }));
-          connection.send(pong, PacketPriority.HIGH_PRIORITY, PacketReliability.UNRELIABLE, 0);
+          connection.send(
+            pong,
+            PacketPriority.HIGH_PRIORITY ?? 1,
+            PacketReliability.UNRELIABLE ?? 0,
+            0
+          );
         }
       } catch (err) {
         console.error('RakNet packet decode error:', err);
@@ -231,44 +250,93 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'OK', timestamp: new Date() });
 });
 
-// OAuth, Accounts, and Math calculation endpoints unchanged...
 app.post('/api/auth/github/callback', async (req, res) => {
   const { code } = req.body;
-  if (!code) return res.status(400).json({ error: 'code is required' });
+
+  if (!code) {
+    return res.status(400).json({ error: 'code is required' });
+  }
+
   if (!GITHUB_CLIENT_ID || !GITHUB_CLIENT_SECRET) {
+    console.error('GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET not configured');
     return res.status(500).json({ error: 'GitHub OAuth is not configured on the server' });
   }
 
   try {
     const tokenResponse = await fetch('https://github.com/login/oauth/access_token', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body: JSON.stringify({ client_id: GITHUB_CLIENT_ID, client_secret: GITHUB_CLIENT_SECRET, code })
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      },
+      body: JSON.stringify({
+        client_id: GITHUB_CLIENT_ID,
+        client_secret: GITHUB_CLIENT_SECRET,
+        code
+      })
     });
+
     const tokenData = await tokenResponse.json();
+
     if (tokenData.error || !tokenData.access_token) {
-      return res.status(400).json({ error: tokenData.error_description || 'Failed token exchange' });
+      console.error('GitHub token exchange failed:', tokenData);
+      return res.status(400).json({
+        error: tokenData.error_description || 'Failed to exchange code for token'
+      });
     }
 
     const profileResponse = await fetch('https://api.github.com/user', {
-      headers: { 'Authorization': `Bearer ${tokenData.access_token}`, 'User-Agent': 'game-tracker-backend' }
+      headers: {
+        'Authorization': `Bearer ${tokenData.access_token}`,
+        'User-Agent': 'game-tracker-backend'
+      }
     });
+
+    if (!profileResponse.ok) {
+      console.error('GitHub profile fetch failed:', profileResponse.status);
+      return res.status(502).json({ error: 'Failed to fetch GitHub profile' });
+    }
+
     const githubUser = await profileResponse.json();
 
-    res.json({ success: true, user: { id: githubUser.id, login: githubUser.login, avatar: githubUser.avatar_url } });
+    if (process.env.CREATOR_GITHUB_ID && githubUser.id.toString() !== process.env.CREATOR_GITHUB_ID) {
+      console.error(`Access denied for user ${githubUser.login} (ID: ${githubUser.id}). Creator ID: ${process.env.CREATOR_GITHUB_ID}`);
+      return res.status(403).json({
+        error: 'Access denied. Only the repository creator can use this app.'
+      });
+    }
+
+    res.json({
+      success: true,
+      user: {
+        id: githubUser.id,
+        login: githubUser.login,
+        avatar: githubUser.avatar_url
+      }
+    });
   } catch (error) {
+    console.error('GitHub OAuth error:', error);
     res.status(500).json({ error: 'GitHub authentication failed' });
   }
 });
 
 app.get('/api/accounts/:userId', async (req, res) => {
   const { userId } = req.params;
+
   try {
-    const result = await pool.query(
-      `SELECT account_name, stats, inventory, progress, created_at, updated_at FROM game_accounts WHERE user_id = $1 ORDER BY created_at ASC`, 
-      [userId]
-    );
-    res.json({ userId, accounts: result.rows.map(serializeAccount), count: result.rows.length });
+    const result = await pool.query(`
+      SELECT account_name, stats, inventory, progress, created_at, updated_at
+      FROM game_accounts
+      WHERE user_id = $1
+      ORDER BY created_at ASC, account_name ASC
+    `, [userId]);
+    const userAccounts = result.rows.map(serializeAccount);
+
+    res.json({
+      userId,
+      accounts: userAccounts,
+      count: userAccounts.length
+    });
   } catch (error) {
     databaseError(res, error);
   }
@@ -278,18 +346,47 @@ app.post('/api/accounts/:userId', async (req, res) => {
   const { userId } = req.params;
   const { accountName, stats, inventory, progress } = req.body;
 
-  if (!accountName) return res.status(400).json({ error: 'accountName is required' });
+  if (!accountName) {
+    return res.status(400).json({ error: 'accountName is required' });
+  }
+
+  const accountStats = stats || DEFAULT_STATS;
+  const accountInventory = inventory || [];
+  const accountProgress = progress || {};
 
   try {
-    const result = await pool.query(`
-      INSERT INTO game_accounts (user_id, account_name, stats, inventory, progress)
-      VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb)
-      ON CONFLICT (user_id, account_name) DO UPDATE SET
-        stats = EXCLUDED.stats, inventory = EXCLUDED.inventory, progress = EXCLUDED.progress, updated_at = NOW()
-      RETURNING account_name, stats, inventory, progress, created_at, updated_at
-    `, [userId, accountName, JSON.stringify(stats || DEFAULT_STATS), JSON.stringify(inventory || []), JSON.stringify(progress || {})]);
+    const existing = await pool.query(`
+      SELECT 1
+      FROM game_accounts
+      WHERE user_id = $1 AND account_name = $2
+    `, [userId, accountName]);
 
-    res.json({ success: true, account: serializeAccount(result.rows[0]) });
+    const result = await pool.query(`
+      INSERT INTO game_accounts (
+        user_id, account_name, stats, inventory, progress
+      )
+      VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb)
+      ON CONFLICT (user_id, account_name)
+      DO UPDATE SET
+        stats = EXCLUDED.stats,
+        inventory = EXCLUDED.inventory,
+        progress = EXCLUDED.progress,
+        updated_at = NOW()
+      RETURNING account_name, stats, inventory, progress, created_at, updated_at
+    `, [
+      userId,
+      accountName,
+      JSON.stringify(accountStats),
+      JSON.stringify(accountInventory),
+      JSON.stringify(accountProgress)
+    ]);
+
+    const wasUpdated = existing.rowCount > 0;
+    res.status(wasUpdated ? 200 : 201).json({
+      success: true,
+      message: `Account "${accountName}" ${wasUpdated ? 'updated' : 'created'}`,
+      account: serializeAccount(result.rows[0])
+    });
   } catch (error) {
     databaseError(res, error);
   }
@@ -297,16 +394,130 @@ app.post('/api/accounts/:userId', async (req, res) => {
 
 app.delete('/api/accounts/:userId/:accountName', async (req, res) => {
   const { userId, accountName } = req.params;
+
   try {
-    const deleted = await pool.query(
-      `DELETE FROM game_accounts WHERE user_id = $1 AND account_name = $2 RETURNING account_name, stats, inventory, progress, created_at, updated_at`,
-      [userId, accountName]
-    );
-    if (deleted.rowCount === 0) return res.status(404).json({ error: 'Account not found' });
-    res.json({ success: true, deletedAccount: serializeAccount(deleted.rows[0]) });
+    const deleted = await pool.query(`
+      DELETE FROM game_accounts
+      WHERE user_id = $1 AND account_name = $2
+      RETURNING account_name, stats, inventory, progress, created_at, updated_at
+    `, [userId, accountName]);
+
+    if (deleted.rowCount === 0) {
+      const user = await pool.query(`
+        SELECT 1
+        FROM game_accounts
+        WHERE user_id = $1
+        LIMIT 1
+      `, [userId]);
+
+      if (user.rowCount === 0) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+
+      return res.status(404).json({ error: 'Account not found' });
+    }
+
+    res.json({
+      success: true,
+      message: `Account "${accountName}" deleted`,
+      deletedAccount: serializeAccount(deleted.rows[0])
+    });
   } catch (error) {
     databaseError(res, error);
   }
+});
+
+app.post('/api/calculate-pot', (req, res) => {
+  const { items } = req.body;
+
+  if (!Array.isArray(items)) {
+    return res.status(400).json({ error: 'items must be an array' });
+  }
+
+  const rarityMultipliers = {
+    'common': 1,
+    'uncommon': 5,
+    'rare': 25,
+    'epic': 125,
+    'legendary': 625
+  };
+
+  let totalPot = 0;
+  const breakdown = {};
+
+  items.forEach(item => {
+    const rarity = item.rarity || 'common';
+    const baseMultiplier = rarityMultipliers[rarity] || 1;
+
+    let itemValue = 0;
+
+    if (item.sellPrice) {
+      itemValue = item.sellPrice;
+    } else {
+      const upgradeBonus = (item.currentUpgrade || 0) * 1.5;
+      itemValue = baseMultiplier * (1 + upgradeBonus);
+    }
+
+    totalPot += itemValue;
+
+    if (!breakdown[rarity]) {
+      breakdown[rarity] = { count: 0, total: 0 };
+    }
+    breakdown[rarity].count += 1;
+    breakdown[rarity].total += itemValue;
+  });
+
+  res.json({
+    totalPot: Math.floor(totalPot),
+    itemCount: items.length,
+    breakdown,
+    calculatedAt: new Date().toISOString()
+  });
+});
+
+app.post('/api/calculate-upgrades', (req, res) => {
+  const { items } = req.body;
+
+  if (!Array.isArray(items)) {
+    return res.status(400).json({ error: 'items must be an array' });
+  }
+
+  const upgradeable = items
+    .filter(item => item.currentUpgrade && item.currentUpgrade < item.maxUpgrades)
+    .map(item => {
+      const baseUpgradeCost = item.sellPrice ? item.sellPrice * 0.75 : 100;
+      const costPerLevel = Math.ceil(baseUpgradeCost * (item.currentUpgrade + 1));
+      const costToMax = costPerLevel * (item.maxUpgrades - item.currentUpgrade);
+
+      return {
+        id: item.id,
+        name: item.name,
+        rarity: item.rarity,
+        currentLevel: item.currentUpgrade,
+        maxLevel: item.maxUpgrades,
+        levelsRemaining: item.maxUpgrades - item.currentUpgrade,
+        costPerLevel,
+        costToMax
+      };
+    })
+    .sort((a, b) => a.costPerLevel - b.costPerLevel);
+
+  const totalUpgradeCost = upgradeable.reduce((sum, item) => sum + item.costToMax, 0);
+
+  res.json({
+    upgradeableItems: upgradeable,
+    count: upgradeable.length,
+    totalUpgradeCost: Math.floor(totalUpgradeCost),
+    calculatedAt: new Date().toISOString()
+  });
+});
+
+app.use((req, res) => {
+  res.status(404).json({ 
+    error: 'Endpoint not found',
+    path: req.path,
+    method: req.method
+  });
 });
 
 // =====================================
@@ -317,17 +528,18 @@ async function startServer() {
   try {
     await initializeDatabase();
 
+    // Start RakNet Server
+    startRakNetServer();
+
     // Start HTTP & WebSocket Server
     server.listen(PORT, '0.0.0.0', () => {
       console.log(`🎮 Game Tracker API running on http://localhost:${PORT}`);
-      console.log(`📡 WebSocket server running`);
+      console.log(`📡 CORS enabled for all origins`);
+      console.log(`🔌 WebSocket server running`);
     });
 
-    // Start RakNet Listener
-    startRakNetServer();
-
   } catch (error) {
-    console.error('Unable to initialize the database:', error.message);
+    console.error('Unable to initialize the server:', error.message);
     process.exitCode = 1;
   }
 }
