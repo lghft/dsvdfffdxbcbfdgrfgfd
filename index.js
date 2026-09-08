@@ -92,11 +92,72 @@ wss.on('connection', (ws) => {
     try {
       const message = JSON.parse(data);
 
+      // 1. Authenticate Client
       if (message.type === 'auth') {
         userId = message.userId;
         wsClients.set(userId, ws);
         console.log(`✅ [WS] User ${userId} authenticated`);
         ws.send(JSON.stringify({ type: 'auth_success', message: 'Connected to WebSocket server' }));
+        return;
+      }
+
+      // 2. Client Remote Logger
+      if (message.type === 'log') {
+        console.log(`📝 [LOG] [${message.data?.level || 'INFO'}] ${message.data?.message}`);
+        return;
+      }
+
+      // 3. Drop Notifications
+      if (message.type === 'drop_notification') {
+        console.log(`🎁 [DROP] ${message.data?.accountName}: ${message.data?.item?.name}`);
+        return;
+      }
+
+      // 4. Game Data Sync Packet (Writes to Postgres)
+      if (message.type === 'sync_account') {
+        const payloadUser = message.userId || userId;
+        const accountData = message.data || {};
+        const { account_name, stats, inventory, progress } = accountData;
+
+        if (!account_name || !payloadUser) {
+          console.error('❌ [WS SYNC] Missing account_name or userId');
+          return;
+        }
+
+        console.log(`📊 [WS SYNC] Saving account "${account_name}" for User ${payloadUser}...`);
+
+        await pool.query(`
+          INSERT INTO game_accounts (user_id, account_name, stats, inventory, progress)
+          VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb)
+          ON CONFLICT (user_id, account_name)
+          DO UPDATE SET
+            stats = EXCLUDED.stats,
+            inventory = EXCLUDED.inventory,
+            progress = EXCLUDED.progress,
+            updated_at = NOW()
+        `, [
+          payloadUser,
+          account_name,
+          JSON.stringify(stats || DEFAULT_STATS),
+          JSON.stringify(inventory || []),
+          JSON.stringify(progress || {})
+        ]);
+
+        console.log(`💾 [DB SUCCESS] Updated database for "${account_name}"`);
+        
+        ws.send(JSON.stringify({
+          type: 'sync_success',
+          accountName: account_name,
+          timestamp: new Date().toISOString()
+        }));
+
+        broadcastMessage({
+          type: 'account_updated',
+          userId: payloadUser,
+          accountName: account_name,
+          stats,
+          timestamp: new Date().toISOString()
+        });
         return;
       }
 
