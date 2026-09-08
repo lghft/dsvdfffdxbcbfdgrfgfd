@@ -1,6 +1,8 @@
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
+const http = require('http');
+const WebSocket = require('ws');
 require('dotenv').config();
 
 const app = express();
@@ -8,6 +10,15 @@ const PORT = process.env.PORT || 3001;
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL
 });
+
+// Create HTTP server (needed for WebSocket upgrade)
+const server = http.createServer(app);
+
+// Create WebSocket server
+const wss = new WebSocket.Server({ server });
+
+// Store connected clients
+const clients = new Map();
 
 // GitHub OAuth (client_secret must ONLY ever live here on the server)
 const GITHUB_CLIENT_ID = process.env.GITHUB_CLIENT_ID;
@@ -58,6 +69,82 @@ function databaseError(res, error) {
 }
 
 // =====================================
+// WEBSOCKET HANDLERS
+// =====================================
+
+wss.on('connection', (ws) => {
+  console.log('🔌 New WebSocket connection');
+  
+  let userId = null;
+
+  ws.on('message', (data) => {
+    try {
+      const message = JSON.parse(data);
+
+      // Handle authentication
+      if (message.type === 'auth') {
+        userId = message.userId;
+        clients.set(userId, ws);
+        console.log(`✅ User ${userId} authenticated`);
+        ws.send(JSON.stringify({ 
+          type: 'auth_success', 
+          message: 'Connected to server' 
+        }));
+        return;
+      }
+
+      // Handle other message types
+      if (message.type === 'stats_update') {
+        console.log(`📊 Stats update from ${userId}:`, message.data);
+        // Broadcast to all connected clients
+        broadcastMessage({
+          type: 'stats_update',
+          userId,
+          data: message.data,
+          timestamp: new Date().toISOString()
+        });
+      }
+
+      if (message.type === 'ping') {
+        ws.send(JSON.stringify({ type: 'pong' }));
+      }
+
+    } catch (error) {
+      console.error('WebSocket message error:', error);
+      ws.send(JSON.stringify({ type: 'error', message: 'Invalid message format' }));
+    }
+  });
+
+  ws.on('close', () => {
+    if (userId) {
+      clients.delete(userId);
+      console.log(`❌ User ${userId} disconnected`);
+    }
+  });
+
+  ws.on('error', (error) => {
+    console.error('WebSocket error:', error);
+  });
+});
+
+// Broadcast message to all connected clients
+function broadcastMessage(message) {
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify(message));
+    }
+  });
+}
+
+// Send message to specific user
+function sendToUser(userId, message) {
+  const userWs = clients.get(userId);
+  if (userWs && userWs.readyState === WebSocket.OPEN) {
+    userWs.send(JSON.stringify(message));
+  }
+}
+
+// =====================================
 // ROUTES
 // =====================================
 
@@ -72,7 +159,8 @@ app.get('/', (req, res) => {
       'POST /api/accounts/:userId',
       'DELETE /api/accounts/:userId/:accountName',
       'POST /api/calculate-pot',
-      'POST /api/calculate-upgrades'
+      'POST /api/calculate-upgrades',
+      'WS /ws (WebSocket connection)'
     ]
   });
 });
@@ -86,9 +174,6 @@ app.get('/api/health', (req, res) => {
 // AUTH ENDPOINTS
 // =====================================
 
-// Exchanges a GitHub OAuth "code" for an access token, then fetches the
-// GitHub profile. This MUST happen server-side because it requires the
-// client_secret, which can never be exposed to the browser.
 app.post('/api/auth/github/callback', async (req, res) => {
   const { code } = req.body;
 
@@ -102,7 +187,6 @@ app.post('/api/auth/github/callback', async (req, res) => {
   }
 
   try {
-    // Step 1: exchange the code for an access token
     const tokenResponse = await fetch('https://github.com/login/oauth/access_token', {
       method: 'POST',
       headers: {
@@ -125,7 +209,6 @@ app.post('/api/auth/github/callback', async (req, res) => {
       });
     }
 
-    // Step 2: use the access token to fetch the GitHub profile
     const profileResponse = await fetch('https://api.github.com/user', {
       headers: {
         'Authorization': `Bearer ${tokenData.access_token}`,
@@ -140,7 +223,6 @@ app.post('/api/auth/github/callback', async (req, res) => {
 
     const githubUser = await profileResponse.json();
 
-    // Verify that the logged-in user is the creator of the repository
     if (process.env.CREATOR_GITHUB_ID && githubUser.id.toString() !== process.env.CREATOR_GITHUB_ID) {
       console.error(`Access denied for user ${githubUser.login} (ID: ${githubUser.id}). Creator ID: ${process.env.CREATOR_GITHUB_ID}`);
       return res.status(403).json({
@@ -148,8 +230,6 @@ app.post('/api/auth/github/callback', async (req, res) => {
       });
     }
 
-    // Note: we intentionally do NOT return the raw access_token to the
-    // browser. The frontend only needs enough to identify the user.
     res.json({
       success: true,
       user: {
@@ -168,7 +248,6 @@ app.post('/api/auth/github/callback', async (req, res) => {
 // ACCOUNTS ENDPOINTS
 // =====================================
 
-// Get all accounts for a user
 app.get('/api/accounts/:userId', async (req, res) => {
   const { userId } = req.params;
 
@@ -191,12 +270,10 @@ app.get('/api/accounts/:userId', async (req, res) => {
   }
 });
 
-// Create or update an account
 app.post('/api/accounts/:userId', async (req, res) => {
   const { userId } = req.params;
   const { accountName, stats, inventory, progress } = req.body;
 
-  // Validate input
   if (!accountName) {
     return res.status(400).json({ error: 'accountName is required' });
   }
@@ -243,7 +320,6 @@ app.post('/api/accounts/:userId', async (req, res) => {
   }
 });
 
-// Delete an account
 app.delete('/api/accounts/:userId/:accountName', async (req, res) => {
   const { userId, accountName } = req.params;
 
@@ -283,7 +359,6 @@ app.delete('/api/accounts/:userId/:accountName', async (req, res) => {
 // CALCULATION ENDPOINTS
 // =====================================
 
-// Calculate total pot value
 app.post('/api/calculate-pot', (req, res) => {
   const { items } = req.body;
 
@@ -308,18 +383,15 @@ app.post('/api/calculate-pot', (req, res) => {
 
     let itemValue = 0;
 
-    // If item has sell price, use that
     if (item.sellPrice) {
       itemValue = item.sellPrice;
     } else {
-      // Otherwise calculate based on rarity and upgrades
       const upgradeBonus = (item.currentUpgrade || 0) * 1.5;
       itemValue = baseMultiplier * (1 + upgradeBonus);
     }
 
     totalPot += itemValue;
 
-    // Breakdown by rarity
     if (!breakdown[rarity]) {
       breakdown[rarity] = { count: 0, total: 0 };
     }
@@ -335,7 +407,6 @@ app.post('/api/calculate-pot', (req, res) => {
   });
 });
 
-// Calculate upgrade costs
 app.post('/api/calculate-upgrades', (req, res) => {
   const { items } = req.body;
 
@@ -361,7 +432,7 @@ app.post('/api/calculate-upgrades', (req, res) => {
         costToMax
       };
     })
-    .sort((a, b) => a.costPerLevel - b.costPerLevel); // Sort by cheapest first
+    .sort((a, b) => a.costPerLevel - b.costPerLevel);
 
   const totalUpgradeCost = upgradeable.reduce((sum, item) => sum + item.costToMax, 0);
 
@@ -392,9 +463,10 @@ app.use((req, res) => {
 async function startServer() {
   try {
     await initializeDatabase();
-    app.listen(PORT, () => {
+    server.listen(PORT, '0.0.0.0', () => {
       console.log(`🎮 Game Tracker API running on http://localhost:${PORT}`);
       console.log(`📡 CORS enabled for all origins`);
+      console.log(`🔌 WebSocket server running`);
       console.log(`📖 Visit http://localhost:${PORT} for API info`);
     });
   } catch (error) {
