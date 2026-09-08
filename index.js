@@ -113,53 +113,57 @@ wss.on('connection', (ws) => {
         return;
       }
 
-      // 4. Game Data Sync Packet (Writes to Postgres)
-      if (message.type === 'sync_account') {
-        const payloadUser = message.userId || userId;
-        const accountData = message.data || {};
-        const { account_name, stats, inventory, progress } = accountData;
+      // 4. Game Data Sync Packet (Writes to Postgres under GitHub ID bucket)
+if (message.type === 'sync_account') {
+  const accountData = message.data || {};
+  const { account_name, stats, inventory, progress } = accountData;
 
-        if (!account_name || !payloadUser) {
-          console.error('❌ [WS SYNC] Missing account_name or userId');
-          return;
-        }
+  // Map incoming game sync to the creator's GitHub user ID if configured
+  const targetUserId = process.env.CREATOR_GITHUB_ID 
+    ? `github_${process.env.CREATOR_GITHUB_ID}` 
+    : (message.userId || userId);
 
-        console.log(`📊 [WS SYNC] Saving account "${account_name}" for User ${payloadUser}...`);
+  if (!account_name || !targetUserId) {
+    console.error('❌ [WS SYNC] Missing account_name or userId');
+    return;
+  }
 
-        await pool.query(`
-          INSERT INTO game_accounts (user_id, account_name, stats, inventory, progress)
-          VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb)
-          ON CONFLICT (user_id, account_name)
-          DO UPDATE SET
-            stats = EXCLUDED.stats,
-            inventory = EXCLUDED.inventory,
-            progress = EXCLUDED.progress,
-            updated_at = NOW()
-        `, [
-          payloadUser,
-          account_name,
-          JSON.stringify(stats || DEFAULT_STATS),
-          JSON.stringify(inventory || []),
-          JSON.stringify(progress || {})
-        ]);
+  console.log(`📊 [WS SYNC] Saving account "${account_name}" for User ${targetUserId}...`);
 
-        console.log(`💾 [DB SUCCESS] Updated database for "${account_name}"`);
-        
-        ws.send(JSON.stringify({
-          type: 'sync_success',
-          accountName: account_name,
-          timestamp: new Date().toISOString()
-        }));
+  await pool.query(`
+    INSERT INTO game_accounts (user_id, account_name, stats, inventory, progress)
+    VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb)
+    ON CONFLICT (user_id, account_name)
+    DO UPDATE SET
+      stats = EXCLUDED.stats,
+      inventory = EXCLUDED.inventory,
+      progress = EXCLUDED.progress,
+      updated_at = NOW()
+  `, [
+    targetUserId,
+    account_name,
+    JSON.stringify(stats || DEFAULT_STATS),
+    JSON.stringify(inventory || []),
+    JSON.stringify(progress || {})
+  ]);
 
-        broadcastMessage({
-          type: 'account_updated',
-          userId: payloadUser,
-          accountName: account_name,
-          stats,
-          timestamp: new Date().toISOString()
-        });
-        return;
-      }
+  console.log(`💾 [DB SUCCESS] Updated database for "${account_name}" under ${targetUserId}`);
+  
+  ws.send(JSON.stringify({
+    type: 'sync_success',
+    accountName: account_name,
+    timestamp: new Date().toISOString()
+  }));
+
+  broadcastMessage({
+    type: 'account_updated',
+    userId: targetUserId,
+    accountName: account_name,
+    stats,
+    timestamp: new Date().toISOString()
+  });
+  return;
+}
 
       if (message.type === 'stats_update') {
         console.log(`📊 [WS] Stats update from ${userId}:`, message.data);
