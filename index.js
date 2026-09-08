@@ -102,16 +102,31 @@ wss.on('connection', (ws) => {
     try {
       const message = JSON.parse(data);
 
-      // 1. Authenticate Client
-      if (message.type === 'auth') {
-        userId = message.userId;
-        accountName = message.accountName || null;
-        wsClients.set(userId, ws);
+        // 1. Authenticate Client
+        if (message.type === 'auth') {
+          userId = message.userId;
+          accountName = message.accountName || null;
         
-        console.log(`✅ [WS] Account "${accountName || 'Unknown'}" (${userId}) authenticated`);
-        ws.send(JSON.stringify({ type: 'auth_success', message: 'Connected to WebSocket server' }));
-        return;
-      }
+          // Immediately close any existing socket for this user (handles page refreshes)
+          if (wsClients.has(userId)) {
+            const existingWs = wsClients.get(userId);
+            if (existingWs && existingWs !== ws) {
+              existingWs.close();
+            }
+          }
+        
+          wsClients.set(userId, ws);
+          
+          // Suppress logging if accountName isn't ready yet
+          if (accountName) {
+            console.log(`✅ [WS] Account "${accountName}" (${userId}) authenticated`);
+          } else {
+            console.log(`✅ [WS] User (${userId}) connected (awaiting account sync)`);
+          }
+        
+          ws.send(JSON.stringify({ type: 'auth_success', message: 'Connected to WebSocket server' }));
+          return;
+        }
 
       // Fallback: capture accountName from sync or status packets if missing in initial auth
       if (message.data?.account_name) accountName = message.data.account_name;
