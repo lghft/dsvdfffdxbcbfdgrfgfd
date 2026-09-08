@@ -3,7 +3,7 @@ const cors = require('cors');
 const { Pool } = require('pg');
 const http = require('http');
 const WebSocket = require('ws');
-const { Server: RakNetServer } = require('js-raknet');
+const raknet = require('raknet-node');
 require('dotenv').config();
 
 const app = express();
@@ -22,7 +22,7 @@ const wss = new WebSocket.Server({ server });
 
 // Track active connections
 const wsClients = new Map();     // userId -> ws connection
-const raknetClients = new Map(); // userId -> raknet address string
+const raknetClients = new Map(); // userId -> raknet session/client
 
 let raknetServer = null;
 
@@ -86,13 +86,13 @@ function broadcastMessage(messageObj) {
   });
 
   // Send to RakNet clients
-  if (raknetServer) {
-    for (const [userId, clientAddr] of raknetClients.entries()) {
-      try {
-        raknetServer.send(clientAddr, Buffer.from(payload));
-      } catch (err) {
-        console.error(`Failed to send RakNet message to user ${userId}:`, err);
+  for (const [userId, rakClient] of raknetClients.entries()) {
+    try {
+      if (rakClient && typeof rakClient.send === 'function') {
+        rakClient.send(Buffer.from(payload));
       }
+    } catch (err) {
+      console.error(`Failed to send RakNet message to user ${userId}:`, err);
     }
   }
 }
@@ -153,43 +153,71 @@ wss.on('connection', (ws) => {
 // =====================================
 
 function startRakNetServer() {
-  raknetServer = new RakNetServer('0.0.0.0', Number(RAKNET_PORT));
+  const ServerClass = raknet.Server || raknet.RakServer || raknet;
+  
+  if (typeof ServerClass !== 'function' && typeof ServerClass.create !== 'function') {
+    console.warn('⚠️ RakNet server class structure missing, running in standalone HTTP/WS mode.');
+    return;
+  }
 
-  raknetServer.on('encapsulated', (packet, address) => {
-    try {
-      const rawString = packet.buffer.toString('utf-8');
-      const message = JSON.parse(rawString);
+  try {
+    raknetServer = typeof ServerClass.create === 'function' 
+      ? ServerClass.create({ host: '0.0.0.0', port: Number(RAKNET_PORT) })
+      : new ServerClass('0.0.0.0', Number(RAKNET_PORT));
 
-      if (message.type === 'auth') {
-        const userId = message.userId;
-        raknetClients.set(userId, address);
-        console.log(`✅ [RakNet] User ${userId} authenticated from ${address}`);
+    raknetServer.on('connect', (client) => {
+      console.log('🔌 New RakNet connection established');
+      let userId = null;
 
-        const ack = Buffer.from(JSON.stringify({ type: 'auth_success', message: 'Connected to RakNet server' }));
-        raknetServer.send(address, ack);
-        return;
-      }
+      client.on('encapsulated', (packet) => {
+        try {
+          const rawString = packet.buffer ? packet.buffer.toString('utf-8') : packet.toString('utf-8');
+          const message = JSON.parse(rawString);
 
-      if (message.type === 'stats_update') {
-        console.log(`📊 [RakNet] Stats update from ${address}:`, message.data);
-        broadcastMessage({
-          type: 'stats_update',
-          data: message.data,
-          timestamp: new Date().toISOString()
-        });
-      }
+          if (message.type === 'auth') {
+            userId = message.userId;
+            raknetClients.set(userId, client);
+            console.log(`✅ [RakNet] User ${userId} authenticated`);
 
-      if (message.type === 'ping') {
-        const pong = Buffer.from(JSON.stringify({ type: 'pong' }));
-        raknetServer.send(address, pong);
-      }
-    } catch (err) {
-      console.error('RakNet packet decode error:', err);
+            const ack = Buffer.from(JSON.stringify({ type: 'auth_success', message: 'Connected to RakNet server' }));
+            client.send(ack);
+            return;
+          }
+
+          if (message.type === 'stats_update') {
+            console.log(`📊 [RakNet] Stats update from ${userId}:`, message.data);
+            broadcastMessage({
+              type: 'stats_update',
+              userId,
+              data: message.data,
+              timestamp: new Date().toISOString()
+            });
+          }
+
+          if (message.type === 'ping') {
+            const pong = Buffer.from(JSON.stringify({ type: 'pong' }));
+            client.send(pong);
+          }
+        } catch (err) {
+          console.error('RakNet packet decode error:', err);
+        }
+      });
+
+      client.on('disconnect', () => {
+        if (userId) {
+          raknetClients.delete(userId);
+          console.log(`❌ [RakNet] User ${userId} disconnected`);
+        }
+      });
+    });
+
+    if (typeof raknetServer.listen === 'function') {
+      raknetServer.listen();
     }
-  });
-
-  raknetServer.listen();
-  console.log(`🚀 RakNet UDP server running on port ${RAKNET_PORT}`);
+    console.log(`🚀 RakNet UDP server running on port ${RAKNET_PORT}`);
+  } catch (err) {
+    console.error('Failed to initialize RakNet server:', err.message);
+  }
 }
 
 // =====================================
@@ -495,7 +523,7 @@ async function startServer() {
   try {
     await initializeDatabase();
 
-    // Start RakNet UDP Listener
+    // Start RakNet Server
     startRakNetServer();
 
     // Start Express & WebSocket Server
