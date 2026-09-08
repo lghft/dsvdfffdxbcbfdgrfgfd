@@ -96,6 +96,7 @@ function broadcastMessage(messageObj) {
 wss.on('connection', (ws) => {
   console.log('🔌 New WebSocket connection');
   let userId = null;
+  let accountName = null;
 
   ws.on('message', async (data) => {
     try {
@@ -104,11 +105,17 @@ wss.on('connection', (ws) => {
       // 1. Authenticate Client
       if (message.type === 'auth') {
         userId = message.userId;
+        accountName = message.accountName || null;
         wsClients.set(userId, ws);
-        console.log(`✅ [WS] User ${userId} authenticated`);
+        
+        console.log(`✅ [WS] Account "${accountName || 'Unknown'}" (${userId}) authenticated`);
         ws.send(JSON.stringify({ type: 'auth_success', message: 'Connected to WebSocket server' }));
         return;
       }
+
+      // Fallback: capture accountName from sync or status packets if missing in initial auth
+      if (message.data?.account_name) accountName = message.data.account_name;
+      if (message.accountName) accountName = message.accountName;
 
       // 2. Client Remote Logger
       if (message.type === 'log') {
@@ -124,7 +131,7 @@ wss.on('connection', (ws) => {
 
       // 4. Status Update (Online / Offline)
       if (message.type === 'status_update') {
-        const { accountName, status } = message;
+        const { status } = message;
         const isOnline = status === 'online';
         const targetUserId = process.env.CREATOR_GITHUB_ID 
           ? `github_${process.env.CREATOR_GITHUB_ID}` 
@@ -163,6 +170,8 @@ wss.on('connection', (ws) => {
           console.error('❌ [WS SYNC] Missing account_name or userId');
           return;
         }
+
+        accountName = account_name;
 
         console.log(`📊 [WS SYNC] Saving account "${account_name}" for User ${targetUserId}...`);
 
@@ -225,10 +234,38 @@ wss.on('connection', (ws) => {
     }
   });
 
-  ws.on('close', () => {
+  // Handle Connection Close
+  ws.on('close', async () => {
+    const targetUserId = process.env.CREATOR_GITHUB_ID 
+      ? `github_${process.env.CREATOR_GITHUB_ID}` 
+      : userId;
+
+    if (accountName && targetUserId) {
+      console.log(`❌ [WS] Account "${accountName}" (${targetUserId}) disconnected`);
+
+      try {
+        await pool.query(`
+          UPDATE game_accounts 
+          SET is_online = false, updated_at = NOW() 
+          WHERE user_id = $1 AND account_name = $2
+        `, [targetUserId, accountName]);
+
+        broadcastMessage({
+          type: 'status_changed',
+          userId: targetUserId,
+          accountName,
+          isOnline: false,
+          timestamp: new Date().toISOString()
+        });
+      } catch (err) {
+        console.error('Failed to update disconnect status in DB:', err);
+      }
+    } else if (userId) {
+      console.log(`❌ [WS] User ${userId} disconnected`);
+    }
+
     if (userId) {
       wsClients.delete(userId);
-      console.log(`❌ [WS] User ${userId} disconnected`);
     }
   });
 
