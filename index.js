@@ -39,6 +39,7 @@ async function initializeDatabase() {
     throw new Error('DATABASE_URL is required to start the API');
   }
 
+  // 1. Create table if it doesn't exist
   await pool.query(`
     CREATE TABLE IF NOT EXISTS game_accounts (
       user_id TEXT NOT NULL,
@@ -51,6 +52,12 @@ async function initializeDatabase() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       PRIMARY KEY (user_id, account_name)
     )
+  `);
+
+  // 2. Add the column to existing tables if it's missing
+  await pool.query(`
+    ALTER TABLE game_accounts 
+    ADD COLUMN IF NOT EXISTS is_online BOOLEAN NOT NULL DEFAULT false;
   `);
 }
 
